@@ -1,0 +1,6 @@
+{
+  "name": "DocuForge - All-in-One PDF & Image Suite",
+  "description": "Fast, professional SaaS suite to merge, split, compress, and convert PDF and images. Enjoy free daily tools or upgrade to Pro for unlimited conversions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
