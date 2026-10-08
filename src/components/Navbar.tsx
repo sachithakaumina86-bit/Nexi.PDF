@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import logoImg from '../assets/images/nexipdf_logo.png';
 import { 
   Sparkles, 
   Shield, 
@@ -43,11 +44,11 @@ export const Navbar: React.FC = () => {
           }}
           className="flex items-center gap-2 group text-left cursor-pointer focus-visible:outline-none"
         >
-          <div className="w-9 h-9 rounded-lg overflow-hidden shadow-sm border border-slate-200/80 bg-slate-950 flex items-center justify-center transition-transform group-hover:scale-105">
+          <div className="w-9 h-9 rounded-lg overflow-hidden shadow-sm border border-slate-200/80 bg-white flex items-center justify-center transition-transform group-hover:scale-105">
             <img
-              src="/src/assets/images/nexipdf_logo_1791430683321.jpg"
+              src={logoImg}
               alt="NexiPDF Logo"
-              className="w-full h-full object-cover scale-110 object-center select-none"
+              className="w-full h-full object-contain p-0.5 select-none"
               referrerPolicy="no-referrer"
             />
           </div>
