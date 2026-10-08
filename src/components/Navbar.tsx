@@ -43,8 +43,13 @@ export const Navbar: React.FC = () => {
           }}
           className="flex items-center gap-2 group text-left cursor-pointer focus-visible:outline-none"
         >
-          <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-lg shadow-sm transition-transform group-hover:scale-105">
-            N
+          <div className="w-9 h-9 rounded-lg overflow-hidden shadow-sm border border-slate-200/80 bg-slate-950 flex items-center justify-center transition-transform group-hover:scale-105">
+            <img
+              src="/src/assets/images/nexipdf_logo_1791430683321.jpg"
+              alt="NexiPDF Logo"
+              className="w-full h-full object-cover scale-110 object-center select-none"
+              referrerPolicy="no-referrer"
+            />
           </div>
           <span className="text-xl font-bold tracking-tight text-slate-900 group-hover:text-indigo-600 transition-colors">
             NexiPDF
