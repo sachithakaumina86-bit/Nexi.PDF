@@ -31,12 +31,34 @@ import {
   ChevronDown,
   Plus,
   FilePlus2,
-  MoveVertical,
+  Layers,
+  Check,
+  RefreshCw,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import JSZip from 'jszip';
 
 interface ToolWorkspaceProps {
   toolId: ToolId;
+}
+
+export interface QueueFileItem {
+  id: string;
+  file: File;
+  status: 'queued' | 'processing' | 'completed' | 'error';
+  progress: number;
+  stageText: string;
+  originalSize: number;
+  newSize?: number;
+  savingsPercent?: number;
+  pageCount?: number;
+  downloadUrl?: string;
+  resultFilename?: string;
+  resultBlob?: Blob;
+  error?: string;
+  previewUrl?: string;
+  secondaryFiles?: { name: string; blob: Blob; url: string; previewUrl?: string }[];
+  zipUrl?: string;
 }
 
 export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
@@ -51,28 +73,28 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
   } = useApp();
 
   const tool = TOOLS_CONFIG.find((t) => t.id === toolId) || TOOLS_CONFIG[0];
+  const isMergeTool = tool.id === 'merge-pdf' || tool.id === 'img-to-pdf';
 
-  // File selection state
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  // File queue state
+  const [fileQueue, setFileQueue] = useState<QueueFileItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Processing state
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [progressPercent, setProgressPercent] = useState(0);
-  const [currentStage, setCurrentStage] = useState('');
+  // Overall batch state
+  const [isProcessingBatch, setIsProcessingBatch] = useState(false);
+  const [overallProgress, setOverallProgress] = useState(0);
+  const [overallStage, setOverallStage] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isZippingAll, setIsZippingAll] = useState(false);
 
-  // Conversion result
-  const [resultData, setResultData] = useState<{
+  // Merged document result (for merge-pdf or img-to-pdf)
+  const [mergedResult, setMergedResult] = useState<{
     downloadUrl: string;
     filename: string;
     originalSize: number;
     newSize: number;
-    savingsPercent?: number;
     pageCount?: number;
-    secondaryFiles?: { name: string; blob: Blob; url: string; previewUrl?: string }[];
-    zipUrl?: string;
+    savingsPercent?: number;
   } | null>(null);
 
   // Tool specific options
@@ -111,16 +133,14 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       validateAndAddFiles(Array.from(e.target.files));
-      // Reset input value to allow re-selecting identical files
       e.target.value = '';
     }
   };
 
   const validateAndAddFiles = (newFiles: File[]) => {
     setErrorMessage(null);
-    setResultData(null);
 
-    const validFiles: File[] = [];
+    const validItems: QueueFileItem[] = [];
     const rejectedFiles: string[] = [];
 
     newFiles.forEach((file) => {
@@ -141,7 +161,25 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
       const isPdfMime = file.type === 'application/pdf' || ext === '.pdf';
 
       if (isAcceptedExt || (isImageTool && isImageMime) || (isPdfTool && isPdfMime)) {
-        validFiles.push(file);
+        // Create preview for image files if available
+        let previewUrl: string | undefined;
+        if (file.type.startsWith('image/')) {
+          try {
+            previewUrl = URL.createObjectURL(file);
+          } catch {
+            // ignore
+          }
+        }
+
+        validItems.push({
+          id: `item_${Math.random().toString(36).substring(2, 9)}_${Date.now()}`,
+          file,
+          status: 'queued',
+          progress: 0,
+          stageText: 'Ready to process',
+          originalSize: file.size,
+          previewUrl,
+        });
       } else {
         rejectedFiles.push(file.name);
       }
@@ -154,21 +192,19 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
       );
     }
 
-    if (validFiles.length > 0) {
-      if (tool.maxFiles === 1) {
-        setSelectedFiles([validFiles[0]]);
-        showToast(`Loaded ${validFiles[0].name}`, 'success');
-      } else {
-        setSelectedFiles((prev) => {
-          const combined = [...prev, ...validFiles].slice(0, tool.maxFiles);
-          return combined;
-        });
-        showToast(`Added ${validFiles.length} file(s) to queue`, 'success');
-      }
+    if (validItems.length > 0) {
+      setFileQueue((prev) => {
+        const combined = [...prev, ...validItems].slice(0, tool.maxFiles);
+        return combined;
+      });
+      showToast(
+        `Added ${validItems.length} file(s) to queue. (${Math.min(fileQueue.length + validItems.length, tool.maxFiles)} total)`,
+        'success'
+      );
     }
   };
 
-  // Support clipboard paste (Ctrl+V / Cmd+V)
+  // Clipboard paste support (Ctrl+V / Cmd+V)
   useEffect(() => {
     const handlePaste = (e: ClipboardEvent) => {
       if (e.clipboardData && e.clipboardData.files.length > 0) {
@@ -179,16 +215,16 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
 
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [tool]);
+  }, [tool, fileQueue.length]);
 
-  const removeFile = (index: number) => {
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
-    setResultData(null);
+  const removeFile = (id: string) => {
+    if (isProcessingBatch) return;
+    setFileQueue((prev) => prev.filter((item) => item.id !== id));
   };
 
   const moveFileUp = (index: number) => {
-    if (index === 0) return;
-    setSelectedFiles((prev) => {
+    if (index === 0 || isProcessingBatch) return;
+    setFileQueue((prev) => {
       const copy = [...prev];
       const temp = copy[index - 1];
       copy[index - 1] = copy[index];
@@ -198,7 +234,8 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
   };
 
   const moveFileDown = (index: number) => {
-    setSelectedFiles((prev) => {
+    if (isProcessingBatch) return;
+    setFileQueue((prev) => {
       if (index >= prev.length - 1) return prev;
       const copy = [...prev];
       const temp = copy[index + 1];
@@ -209,168 +246,439 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
   };
 
   const clearAllFiles = () => {
-    setSelectedFiles([]);
-    setResultData(null);
+    if (isProcessingBatch) return;
+    fileQueue.forEach((item) => {
+      if (item.downloadUrl) URL.revokeObjectURL(item.downloadUrl);
+      if (item.zipUrl) URL.revokeObjectURL(item.zipUrl);
+      if (item.previewUrl && !item.previewUrl.startsWith('data:')) URL.revokeObjectURL(item.previewUrl);
+    });
+    if (mergedResult?.downloadUrl) {
+      URL.revokeObjectURL(mergedResult.downloadUrl);
+    }
+    setFileQueue([]);
+    setMergedResult(null);
     setErrorMessage(null);
+    setOverallProgress(0);
+    setOverallStage('');
   };
 
-  // Run conversion pipeline
+  // Helper to update specific file queue item
+  const updateQueueItem = (id: string, updates: Partial<QueueFileItem>) => {
+    setFileQueue((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...updates } : item))
+    );
+  };
+
+  // Download all completed results bundled into a ZIP archive
+  const handleDownloadAllZip = async () => {
+    const completedItems = fileQueue.filter((item) => item.status === 'completed' && item.resultBlob);
+    if (completedItems.length === 0) {
+      showToast('No completed files available to download.', 'info');
+      return;
+    }
+
+    setIsZippingAll(true);
+    try {
+      const zip = new JSZip();
+
+      completedItems.forEach((item, idx) => {
+        const filename = item.resultFilename || `converted-file-${idx + 1}`;
+        zip.file(filename, item.resultBlob!);
+
+        // Also include secondary extracted files if any (e.g. split pages or pdf-to-img)
+        if (item.secondaryFiles && item.secondaryFiles.length > 0) {
+          const subfolderName = filename.replace(/\.[^/.]+$/, '');
+          const folder = zip.folder(subfolderName);
+          if (folder) {
+            item.secondaryFiles.forEach((sec) => {
+              folder.file(sec.name, sec.blob);
+            });
+          }
+        }
+      });
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const downloadUrl = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = `${tool.id}-bulk-results-${Date.now()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(downloadUrl);
+
+      showToast(`Downloaded batch bundle with ${completedItems.length} file(s)!`, 'success');
+    } catch (err) {
+      showToast('Failed to create ZIP package. You can download files individually.', 'error');
+    } finally {
+      setIsZippingAll(false);
+    }
+  };
+
+  // Execute processing pipeline
   const handleProcess = async () => {
-    // 1. Quota check: if free user hit 3/3 daily limit
+    if (isProcessingBatch) return;
+
+    // Check usage limits for free tier
     if (isUsageLimitReached) {
       setIsUpgradeModalOpen(true);
       return;
     }
 
-    if (selectedFiles.length === 0) {
+    if (fileQueue.length === 0) {
       setErrorMessage('Please upload at least one file to process.');
       return;
     }
 
-    if (tool.id === 'merge-pdf' && selectedFiles.length < 2) {
-      setErrorMessage('Merge PDF requires at least 2 PDF files.');
+    if (tool.id === 'merge-pdf' && fileQueue.length < 2) {
+      setErrorMessage('Merge PDF requires at least 2 PDF files in the queue.');
       return;
     }
 
-    setIsProcessing(true);
-    setProgressPercent(5);
-    setCurrentStage('Preparing workflow...');
+    setIsProcessingBatch(true);
     setErrorMessage(null);
+    setMergedResult(null);
 
-    try {
-      const firstFile = selectedFiles[0];
-      const initialTotalSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+    // ==========================================
+    // CASE A: MERGING WORKFLOW (merge-pdf, img-to-pdf)
+    // Combines all uploaded files into ONE output document
+    // ==========================================
+    if (isMergeTool) {
+      const rawFiles = fileQueue.map((item) => item.file);
+      const totalRawSize = rawFiles.reduce((acc, f) => acc + f.size, 0);
 
-      let finalBlob: Blob;
-      let finalFilename: string;
-      let finalSavings: number | undefined;
-      let secondaryList: { name: string; blob: Blob; url: string; previewUrl?: string }[] = [];
-      let zipDownloadUrl: string | undefined;
+      setOverallProgress(5);
+      setOverallStage(`Initializing merge pipeline for ${rawFiles.length} files...`);
 
-      const onProgress = (percent: number, stage: string) => {
-        setProgressPercent(percent);
-        setCurrentStage(stage);
-      };
+      // Mark all items queued
+      fileQueue.forEach((item) => {
+        updateQueueItem(item.id, {
+          status: 'queued',
+          progress: 10,
+          stageText: 'Waiting in merge queue...',
+        });
+      });
 
-      if (tool.id === 'merge-pdf') {
-        const res = await mergePDFs(selectedFiles, onProgress);
-        finalBlob = res.blob;
-        finalFilename = res.filename;
-      } else if (tool.id === 'split-pdf') {
-        const res = await splitPDF(firstFile, splitMode, { rangeStr: splitRange, interval: 2 }, onProgress);
-        finalBlob = res.files[0].blob;
-        finalFilename = res.files[0].name;
+      try {
+        let finalBlob: Blob;
+        let finalFilename: string;
+        let totalPageCount = 0;
 
-        if (res.zipBlob) {
-          zipDownloadUrl = URL.createObjectURL(res.zipBlob);
+        if (tool.id === 'merge-pdf') {
+          // Track per-file ingestion in mergePDFs
+          const res = await mergePDFs(rawFiles, (percent, stage) => {
+            setOverallProgress(percent);
+            setOverallStage(stage);
+
+            // Update each file's progress bar dynamically
+            const activeFileIndex = Math.min(
+              rawFiles.length - 1,
+              Math.floor(((percent - 15) / 70) * rawFiles.length)
+            );
+
+            fileQueue.forEach((item, idx) => {
+              if (idx < activeFileIndex) {
+                updateQueueItem(item.id, {
+                  status: 'completed',
+                  progress: 100,
+                  stageText: 'Merged into output',
+                });
+              } else if (idx === activeFileIndex) {
+                updateQueueItem(item.id, {
+                  status: 'processing',
+                  progress: Math.min(95, Math.round(((percent % (70 / rawFiles.length)) / (70 / rawFiles.length)) * 100)),
+                  stageText: 'Reading pages...',
+                });
+              } else {
+                updateQueueItem(item.id, {
+                  status: 'queued',
+                  progress: 0,
+                  stageText: 'Waiting for merge...',
+                });
+              }
+            });
+          });
+
+          finalBlob = res.blob;
+          finalFilename = res.filename;
+          totalPageCount = res.pageCount;
+        } else {
+          // img-to-pdf
+          const res = await imagesToPDF(
+            rawFiles,
+            { orientation: pdfOrientation, margin: pdfMargin },
+            (percent, stage) => {
+              setOverallProgress(percent);
+              setOverallStage(stage);
+
+              const activeFileIndex = Math.min(
+                rawFiles.length - 1,
+                Math.floor(((percent - 20) / 70) * rawFiles.length)
+              );
+
+              fileQueue.forEach((item, idx) => {
+                if (idx < activeFileIndex) {
+                  updateQueueItem(item.id, {
+                    status: 'completed',
+                    progress: 100,
+                    stageText: 'Rendered into PDF',
+                  });
+                } else if (idx === activeFileIndex) {
+                  updateQueueItem(item.id, {
+                    status: 'processing',
+                    progress: Math.min(95, Math.max(10, Math.round(((percent % 25) / 25) * 100))),
+                    stageText: 'Rendering page canvas...',
+                  });
+                } else {
+                  updateQueueItem(item.id, {
+                    status: 'queued',
+                    progress: 0,
+                    stageText: 'Queued for PDF layout',
+                  });
+                }
+              });
+            }
+          );
+
+          finalBlob = res.blob;
+          finalFilename = res.filename;
+          totalPageCount = res.pageCount;
         }
 
-        secondaryList = res.files.map((f) => ({
-          name: f.name,
-          blob: f.blob,
-          url: URL.createObjectURL(f.blob),
-        }));
-      } else if (tool.id === 'compress-pdf') {
-        const res = await compressPDF(firstFile, compressLevel, onProgress);
-        finalBlob = res.blob;
-        finalFilename = res.filename;
-        finalSavings = res.savingsPercent;
-      } else if (tool.id === 'pdf-to-img') {
-        const res = await pdfToImages(firstFile, 'png', onProgress);
-        finalBlob = res.pages[0].blob;
-        finalFilename = res.pages[0].filename;
+        // All files merged successfully
+        fileQueue.forEach((item) => {
+          updateQueueItem(item.id, {
+            status: 'completed',
+            progress: 100,
+            stageText: 'Merged into final document',
+          });
+        });
 
-        if (res.zipBlob) {
-          zipDownloadUrl = URL.createObjectURL(res.zipBlob);
-        }
+        const downloadUrl = URL.createObjectURL(finalBlob);
+        setOverallProgress(100);
+        setOverallStage('Merge complete!');
 
-        secondaryList = res.pages.map((p) => ({
-          name: p.filename,
-          blob: p.blob,
-          url: URL.createObjectURL(p.blob),
-          previewUrl: p.dataUrl,
-        }));
-      } else if (tool.id === 'img-to-pdf') {
-        const res = await imagesToPDF(
-          selectedFiles,
-          { orientation: pdfOrientation, margin: pdfMargin },
-          onProgress
-        );
-        finalBlob = res.blob;
-        finalFilename = res.filename;
-      } else if (tool.id === 'pdf-to-word') {
-        const res = await pdfToWord(firstFile, onProgress);
-        finalBlob = res.docxBlob;
-        finalFilename = res.filename;
-      } else if (tool.id === 'word-to-pdf') {
-        const res = await wordToPDF(firstFile, onProgress);
-        finalBlob = res.pdfBlob;
-        finalFilename = res.filename;
-      } else if (tool.id === 'image-convert') {
-        const res = await convertImageFormat(
-          firstFile,
-          targetImgFormat,
-          imageQuality / 100,
-          1.0,
-          onProgress
-        );
-        finalBlob = res.blob;
-        finalFilename = res.filename;
-        if (res.newSize < res.originalSize) {
-          finalSavings = Math.round(((res.originalSize - res.newSize) / res.originalSize) * 100);
+        setMergedResult({
+          downloadUrl,
+          filename: finalFilename,
+          originalSize: totalRawSize,
+          newSize: finalBlob.size,
+          pageCount: totalPageCount,
+        });
+
+        recordConversionUsage({
+          toolId: tool.id,
+          toolName: tool.title,
+          inputFileName: `${rawFiles.length} files (${rawFiles[0].name}...)`,
+          inputFileSize: totalRawSize,
+          outputFileName: finalFilename,
+          outputFileSize: finalBlob.size,
+          status: 'completed',
+          downloadUrl,
+        });
+
+        showToast(`Successfully merged ${rawFiles.length} files into ${finalFilename}!`, 'success');
+
+        try {
+          confetti({
+            particleCount: 50,
+            spread: 60,
+            origin: { y: 0.7 },
+          });
+        } catch {
+          // ignore
         }
-      } else {
-        throw new Error('Unsupported tool action.');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Merge failed. Please verify the document format.';
+        setErrorMessage(msg);
+        showToast(msg, 'error');
+      } finally {
+        setIsProcessingBatch(false);
       }
 
-      const downloadUrl = URL.createObjectURL(finalBlob);
+      return;
+    }
 
-      setResultData({
-        downloadUrl,
-        filename: finalFilename,
-        originalSize: initialTotalSize,
-        newSize: finalBlob.size,
-        savingsPercent: finalSavings,
-        secondaryFiles: secondaryList,
-        zipUrl: zipDownloadUrl,
+    // ==========================================
+    // CASE B: BATCH CONVERSION WORKFLOW
+    // Converts each file individually with per-file progress bar tracking
+    // ==========================================
+    const totalFiles = fileQueue.length;
+    let completedCount = 0;
+    let failedCount = 0;
+
+    for (let index = 0; index < fileQueue.length; index++) {
+      const item = fileQueue[index];
+
+      // Update overall progress
+      const batchPercent = Math.round((index / totalFiles) * 100);
+      setOverallProgress(batchPercent);
+      setOverallStage(`Processing file ${index + 1} of ${totalFiles}: ${item.file.name}`);
+
+      // Start this file's progress bar
+      updateQueueItem(item.id, {
+        status: 'processing',
+        progress: 10,
+        stageText: 'Starting conversion...',
       });
 
-      // Record in history & decrement daily quota
-      recordConversionUsage({
-        toolId: tool.id,
-        toolName: tool.title,
-        inputFileName: firstFile.name,
-        inputFileSize: initialTotalSize,
-        outputFileName: finalFilename,
-        outputFileSize: finalBlob.size,
-        savingsPercent: finalSavings,
-        status: 'completed',
-        downloadUrl,
-      });
+      try {
+        let finalBlob: Blob;
+        let finalFilename: string;
+        let finalSavings: number | undefined;
+        let secondaryList: { name: string; blob: Blob; url: string; previewUrl?: string }[] = [];
+        let zipDownloadUrl: string | undefined;
 
-      showToast(`Success! ${finalFilename} ready for download.`, 'success');
+        const onFileProgress = (percent: number, stage: string) => {
+          updateQueueItem(item.id, {
+            progress: percent,
+            stageText: stage,
+          });
+        };
 
+        if (tool.id === 'compress-pdf') {
+          const res = await compressPDF(item.file, compressLevel, onFileProgress);
+          finalBlob = res.blob;
+          finalFilename = res.filename;
+          finalSavings = res.savingsPercent;
+        } else if (tool.id === 'split-pdf') {
+          const res = await splitPDF(item.file, splitMode, { rangeStr: splitRange, interval: 2 }, onFileProgress);
+          finalBlob = res.files[0].blob;
+          finalFilename = res.files[0].name;
+
+          if (res.zipBlob) {
+            zipDownloadUrl = URL.createObjectURL(res.zipBlob);
+          }
+
+          secondaryList = res.files.map((f) => ({
+            name: f.name,
+            blob: f.blob,
+            url: URL.createObjectURL(f.blob),
+          }));
+        } else if (tool.id === 'pdf-to-img') {
+          const res = await pdfToImages(item.file, 'png', onFileProgress);
+          finalBlob = res.pages[0].blob;
+          finalFilename = res.pages[0].filename;
+
+          if (res.zipBlob) {
+            zipDownloadUrl = URL.createObjectURL(res.zipBlob);
+          }
+
+          secondaryList = res.pages.map((p) => ({
+            name: p.filename,
+            blob: p.blob,
+            url: URL.createObjectURL(p.blob),
+            previewUrl: p.dataUrl,
+          }));
+        } else if (tool.id === 'pdf-to-word') {
+          const res = await pdfToWord(item.file, onFileProgress);
+          finalBlob = res.docxBlob;
+          finalFilename = res.filename;
+        } else if (tool.id === 'word-to-pdf') {
+          const res = await wordToPDF(item.file, onFileProgress);
+          finalBlob = res.pdfBlob;
+          finalFilename = res.filename;
+        } else if (tool.id === 'image-convert') {
+          const res = await convertImageFormat(
+            item.file,
+            targetImgFormat,
+            imageQuality / 100,
+            1.0,
+            onFileProgress
+          );
+          finalBlob = res.blob;
+          finalFilename = res.filename;
+          if (res.newSize < res.originalSize) {
+            finalSavings = Math.round(((res.originalSize - res.newSize) / res.originalSize) * 100);
+          }
+        } else {
+          throw new Error('Unsupported tool configuration.');
+        }
+
+        const downloadUrl = URL.createObjectURL(finalBlob);
+
+        // Update item state to completed with final stats
+        updateQueueItem(item.id, {
+          status: 'completed',
+          progress: 100,
+          stageText: finalSavings
+            ? `Completed (${formatBytes(finalBlob.size)}, -${finalSavings}%)`
+            : `Completed (${formatBytes(finalBlob.size)})`,
+          resultBlob: finalBlob,
+          resultFilename: finalFilename,
+          downloadUrl,
+          newSize: finalBlob.size,
+          savingsPercent: finalSavings,
+          secondaryFiles: secondaryList,
+          zipUrl: zipDownloadUrl,
+        });
+
+        // Record conversion record
+        recordConversionUsage({
+          toolId: tool.id,
+          toolName: tool.title,
+          inputFileName: item.file.name,
+          inputFileSize: item.file.size,
+          outputFileName: finalFilename,
+          outputFileSize: finalBlob.size,
+          savingsPercent: finalSavings,
+          status: 'completed',
+          downloadUrl,
+        });
+
+        completedCount++;
+      } catch (itemErr: unknown) {
+        const itemErrMsg = itemErr instanceof Error ? itemErr.message : 'Conversion error';
+        updateQueueItem(item.id, {
+          status: 'error',
+          progress: 100,
+          stageText: `Failed: ${itemErrMsg}`,
+          error: itemErrMsg,
+        });
+        failedCount++;
+      }
+    }
+
+    setOverallProgress(100);
+    setOverallStage(
+      failedCount > 0
+        ? `Batch finished: ${completedCount} completed, ${failedCount} failed.`
+        : `All ${completedCount} files processed successfully!`
+    );
+    setIsProcessingBatch(false);
+
+    if (completedCount > 0) {
+      showToast(`Batch complete! ${completedCount} file(s) ready.`, 'success');
       try {
         confetti({
           particleCount: 50,
           spread: 60,
           origin: { y: 0.7 },
         });
-      } catch (e) { /* ignore */ }
-
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Processing failed. Please verify the document format.';
-      setErrorMessage(msg);
-      showToast(msg, 'error');
-    } finally {
-      setIsProcessing(false);
+      } catch {
+        // ignore
+      }
+    } else {
+      showToast('Batch processing encountered errors.', 'error');
     }
+  };
+
+  const completedCount = fileQueue.filter((item) => item.status === 'completed').length;
+  const hasCompletedFiles = completedCount > 0;
+
+  // File format helper badge
+  const getFileBadgeColor = (filename: string) => {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    if (ext === 'pdf') return 'bg-rose-50 text-rose-700 border-rose-200';
+    if (ext === 'docx' || ext === 'doc') return 'bg-blue-50 text-blue-700 border-blue-200';
+    if (['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext || ''))
+      return 'bg-violet-50 text-violet-700 border-violet-200';
+    return 'bg-slate-100 text-slate-700 border-slate-200';
   };
 
   return (
     <div className="py-8 max-w-5xl mx-auto px-4 sm:px-6">
-      
-      {/* Back button and tool title banner */}
+      {/* Top Breadcrumb and Tool Title Banner */}
       <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <button
@@ -383,8 +691,8 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
               {tool.title}
             </h1>
-            <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100">
-              {tool.badge || 'Fast Tool'}
+            <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100">
+              {tool.badge || 'Bulk Ready'}
             </span>
           </div>
           <p className="mt-1 text-sm text-slate-600 max-w-2xl">
@@ -392,7 +700,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
           </p>
         </div>
 
-        {/* Remaining uses notice */}
+        {/* Free daily quota badge */}
         {currentUser.role === 'user' && (
           <div className="sm:self-start bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900 shrink-0">
             <div className="flex items-center gap-1.5 font-semibold text-amber-800">
@@ -406,11 +714,10 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
         )}
       </div>
 
-      {/* Main interactive workspace box */}
+      {/* Main Interactive Workspace Card */}
       <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
-        
-        {/* Step 1: Upload or File Queue */}
-        {selectedFiles.length === 0 ? (
+        {/* Step 1: Initial Upload Dropzone when queue is empty */}
+        {fileQueue.length === 0 ? (
           <div
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -426,40 +733,42 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
               ref={fileInputRef}
               type="file"
               className="hidden"
-              multiple={tool.maxFiles > 1}
+              multiple
               accept={tool.acceptedMimeTypes}
               onChange={handleFileInputChange}
             />
 
-            {/* Glowing drag-over state pill */}
+            {/* Glowing drag-over pill */}
             {isDragging ? (
               <div className="inline-flex items-center gap-2 px-3 py-1 bg-indigo-600 text-white rounded-full text-xs font-semibold mb-4 shadow-sm animate-pulse">
                 <UploadCloud className="w-4 h-4" />
-                <span>Drop files now to import</span>
+                <span>Drop multiple files now to import</span>
               </div>
             ) : null}
 
-            <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-transform shadow-xs ${
-              isDragging 
-                ? 'bg-indigo-600 text-white scale-110' 
-                : 'bg-indigo-100 text-indigo-600 group-hover:scale-105'
-            }`}>
+            <div
+              className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 transition-transform shadow-xs ${
+                isDragging
+                  ? 'bg-indigo-600 text-white scale-110'
+                  : 'bg-indigo-100 text-indigo-600 group-hover:scale-105'
+              }`}
+            >
               <UploadCloud className="w-8 h-8" />
             </div>
 
             <h3 className="text-lg sm:text-xl font-bold text-slate-900 mb-1.5">
-              {isDragging ? 'Release to upload' : `Drag & drop ${tool.maxFiles > 1 ? 'files' : 'your file'} here`}
+              {isDragging ? 'Release to upload files' : `Drag & drop ${isMergeTool ? 'files to merge' : 'files for bulk conversion'}`}
             </h3>
 
-            <p className="text-xs text-slate-500 max-w-md mx-auto mb-5 leading-relaxed">
-              Drop files anywhere in this box, click to browse, or press{' '}
+            <p className="text-xs text-slate-500 max-w-md mx-auto mb-4 leading-relaxed">
+              Upload multiple files at once. Drop files anywhere, click to browse, or press{' '}
               <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-slate-100 border border-slate-300 rounded text-slate-700">
                 Ctrl+V
               </kbd>{' '}
-              to paste from clipboard
+              to paste from clipboard.
             </p>
 
-            {/* Supported format badges */}
+            {/* Format badges */}
             <div className="flex flex-wrap items-center justify-center gap-1.5 mb-6">
               {tool.acceptedFormats.map((fmt) => (
                 <span
@@ -470,7 +779,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
                 </span>
               ))}
               <span className="text-[11px] text-slate-400 self-center ml-1">
-                · Up to 100MB per file
+                · Up to {tool.maxFiles} files · Up to 100MB each
               </span>
             </div>
 
@@ -479,136 +788,314 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
               className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs hover:shadow-md transition-all cursor-pointer inline-flex items-center gap-2"
             >
               <FilePlus2 className="w-4 h-4" />
-              <span>Browse {tool.maxFiles > 1 ? 'Files' : 'File'}</span>
+              <span>Browse Multiple Files</span>
             </button>
           </div>
         ) : (
           <div className="p-6">
-            
-            {/* Header of selected file stage */}
-            <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-4">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold text-slate-900">
-                  {selectedFiles.length} {selectedFiles.length === 1 ? 'File' : 'Files'} Selected
+            {/* Header of Active File Queue */}
+            <div className="flex flex-wrap items-center justify-between pb-4 border-b border-slate-100 mb-4 gap-3">
+              <div className="flex items-center gap-2.5">
+                <span className="text-sm font-bold text-slate-900">
+                  {fileQueue.length} {fileQueue.length === 1 ? 'File' : 'Files'} in Queue
                 </span>
                 <span className="text-xs text-slate-400">·</span>
-                <span className="text-xs text-slate-500 tabular-nums">
-                  Total {formatBytes(selectedFiles.reduce((acc, f) => acc + f.size, 0))}
+                <span className="text-xs text-slate-500 tabular-nums font-medium">
+                  Total {formatBytes(fileQueue.reduce((acc, item) => acc + item.originalSize, 0))}
                 </span>
+                {completedCount > 0 && (
+                  <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md text-[11px] font-semibold">
+                    {completedCount}/{fileQueue.length} Done
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
-                {tool.maxFiles > 1 && selectedFiles.length < tool.maxFiles && (
+                {fileQueue.length < tool.maxFiles && !isProcessingBatch && (
                   <button
                     onClick={() => fileInputRef.current?.click()}
-                    className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition-colors cursor-pointer flex items-center gap-1"
+                    className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition-colors cursor-pointer flex items-center gap-1.5"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add More</span>
+                    <Plus className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Add More Files</span>
                   </button>
                 )}
-                <button
-                  onClick={clearAllFiles}
-                  className="px-3 py-1.5 text-rose-600 hover:bg-rose-50 rounded-lg text-xs font-medium transition-colors cursor-pointer"
-                >
-                  Clear All
-                </button>
+                {!isProcessingBatch && (
+                  <button
+                    onClick={clearAllFiles}
+                    className="px-3 py-1.5 text-rose-600 hover:bg-rose-50 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+                  >
+                    Clear Queue
+                  </button>
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
                   className="hidden"
-                  multiple={tool.maxFiles > 1}
+                  multiple
                   accept={tool.acceptedMimeTypes}
                   onChange={handleFileInputChange}
                 />
               </div>
             </div>
 
-            {/* List of files with size, re-order controls, and remove action */}
-            <div className="space-y-2 max-h-64 overflow-y-auto pr-1 mb-4">
-              {selectedFiles.map((file, idx) => (
-                <div
-                  key={`${file.name}-${idx}`}
-                  className="flex items-center justify-between p-3 bg-slate-50 border border-slate-200/70 rounded-xl hover:border-slate-300 transition-colors"
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
-                      <FileIcon className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[11px] font-mono text-slate-400 font-semibold">
-                          #{idx + 1}
-                        </span>
-                        <p className="text-xs font-semibold text-slate-800 truncate">
-                          {file.name}
-                        </p>
-                      </div>
-                      <p className="text-[11px] text-slate-400 tabular-nums">
-                        {formatBytes(file.size)}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-1 shrink-0">
-                    {/* Reorder controls for multi-file tools */}
-                    {tool.maxFiles > 1 && selectedFiles.length > 1 && (
-                      <div className="flex items-center border border-slate-200 rounded-lg bg-white overflow-hidden mr-1">
-                        <button
-                          disabled={idx === 0}
-                          onClick={() => moveFileUp(idx)}
-                          className="p-1 hover:bg-slate-100 disabled:opacity-30 text-slate-500 transition-colors cursor-pointer"
-                          title="Move up"
-                        >
-                          <ChevronUp className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          disabled={idx === selectedFiles.length - 1}
-                          onClick={() => moveFileDown(idx)}
-                          className="p-1 hover:bg-slate-100 disabled:opacity-30 text-slate-500 transition-colors cursor-pointer"
-                          title="Move down"
-                        >
-                          <ChevronDown className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
+            {/* Overall Batch Progress Indicator (when processing or completed) */}
+            {(isProcessingBatch || overallProgress > 0) && (
+              <div className="p-4 bg-indigo-50/70 border border-indigo-100 rounded-xl mb-5">
+                <div className="flex items-center justify-between text-xs font-semibold text-indigo-900 mb-2">
+                  <div className="flex items-center gap-2">
+                    {isProcessingBatch ? (
+                      <RotateCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                    ) : overallProgress === 100 ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    ) : (
+                      <Layers className="w-3.5 h-3.5 text-indigo-600" />
                     )}
-
-                    <button
-                      onClick={() => removeFile(idx)}
-                      className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-                      title="Remove file"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                    <span>{overallStage || (isProcessingBatch ? 'Processing batch...' : 'Batch Completed')}</span>
                   </div>
+                  <span className="tabular-nums font-mono text-indigo-700 font-bold">{overallProgress}%</span>
                 </div>
-              ))}
+                <div className="w-full h-2.5 bg-indigo-200/60 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-300 rounded-full ${
+                      overallProgress === 100 ? 'bg-emerald-600' : 'bg-indigo-600'
+                    }`}
+                    style={{ width: `${overallProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Individual File Queue with Granular Progress Bar for EACH file */}
+            <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1 mb-5">
+              {fileQueue.map((item, idx) => {
+                const isItemProcessing = item.status === 'processing';
+                const isItemCompleted = item.status === 'completed';
+                const isItemError = item.status === 'error';
+                const ext = item.file.name.split('.').pop()?.toUpperCase() || 'FILE';
+
+                return (
+                  <div
+                    key={item.id}
+                    className={`p-3.5 rounded-xl border transition-all ${
+                      isItemProcessing
+                        ? 'bg-indigo-50/40 border-indigo-300 ring-2 ring-indigo-500/10 shadow-xs'
+                        : isItemCompleted
+                        ? 'bg-emerald-50/30 border-emerald-200/80'
+                        : isItemError
+                        ? 'bg-rose-50/30 border-rose-200'
+                        : 'bg-slate-50/70 border-slate-200/70 hover:border-slate-300'
+                    }`}
+                  >
+                    {/* Top Row: File Meta & State Badges */}
+                    <div className="flex items-center justify-between gap-3 mb-2">
+                      <div className="flex items-center gap-3 min-w-0">
+                        {/* File type icon / thumbnail */}
+                        {item.previewUrl ? (
+                          <div
+                            onClick={() => setPreviewItem({ url: item.previewUrl!, title: item.file.name })}
+                            className="w-9 h-9 rounded-lg overflow-hidden border border-slate-200 bg-slate-100 shrink-0 cursor-pointer relative group"
+                            title="Click to preview"
+                          >
+                            <img
+                              src={item.previewUrl}
+                              alt={item.file.name}
+                              className="w-full h-full object-cover"
+                            />
+                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white transition-opacity">
+                              <Eye className="w-3.5 h-3.5" />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="w-9 h-9 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0 font-bold text-[10px]">
+                            {ext.slice(0, 4)}
+                          </div>
+                        )}
+
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] font-mono text-slate-400 font-semibold shrink-0">
+                              #{idx + 1}
+                            </span>
+                            <p className="text-xs font-semibold text-slate-900 truncate" title={item.file.name}>
+                              {item.file.name}
+                            </p>
+                            <span
+                              className={`text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded border shrink-0 ${getFileBadgeColor(
+                                item.file.name
+                              )}`}
+                            >
+                              {ext}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px] text-slate-500 mt-0.5">
+                            <span className="tabular-nums font-medium">{formatBytes(item.originalSize)}</span>
+                            {item.newSize && item.newSize !== item.originalSize && (
+                              <>
+                                <span>→</span>
+                                <span className="font-semibold text-slate-800 tabular-nums">
+                                  {formatBytes(item.newSize)}
+                                </span>
+                              </>
+                            )}
+                            {item.savingsPercent !== undefined && item.savingsPercent > 0 && (
+                              <span className="text-emerald-700 font-semibold tabular-nums">
+                                (-{item.savingsPercent}%)
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Right controls: Status pill / Action buttons */}
+                      <div className="flex items-center gap-2 shrink-0">
+                        {/* Status Badge */}
+                        {isItemProcessing && (
+                          <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-semibold flex items-center gap-1 animate-pulse">
+                            <RotateCw className="w-3 h-3 animate-spin" />
+                            <span>Processing</span>
+                          </span>
+                        )}
+                        {isItemCompleted && (
+                          <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-semibold flex items-center gap-1">
+                            <Check className="w-3 h-3" />
+                            <span>Done</span>
+                          </span>
+                        )}
+                        {isItemError && (
+                          <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 text-[10px] font-semibold flex items-center gap-1">
+                            <AlertCircle className="w-3 h-3" />
+                            <span>Error</span>
+                          </span>
+                        )}
+                        {item.status === 'queued' && (
+                          <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-semibold">
+                            Queued
+                          </span>
+                        )}
+
+                        {/* Individual Download button if completed and has output URL */}
+                        {isItemCompleted && item.downloadUrl && (
+                          <a
+                            href={item.downloadUrl}
+                            download={item.resultFilename || item.file.name}
+                            className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
+                            title="Download this file"
+                          >
+                            <Download className="w-3 h-3" />
+                            <span>Download</span>
+                          </a>
+                        )}
+
+                        {/* Reorder controls for merging tools */}
+                        {isMergeTool && fileQueue.length > 1 && !isProcessingBatch && (
+                          <div className="flex items-center border border-slate-200 rounded-lg bg-white overflow-hidden">
+                            <button
+                              disabled={idx === 0}
+                              onClick={() => moveFileUp(idx)}
+                              className="p-1 hover:bg-slate-100 disabled:opacity-30 text-slate-500 transition-colors cursor-pointer"
+                              title="Move up"
+                            >
+                              <ChevronUp className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              disabled={idx === fileQueue.length - 1}
+                              onClick={() => moveFileDown(idx)}
+                              className="p-1 hover:bg-slate-100 disabled:opacity-30 text-slate-500 transition-colors cursor-pointer"
+                              title="Move down"
+                            >
+                              <ChevronDown className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Remove item button */}
+                        {!isProcessingBatch && (
+                          <button
+                            onClick={() => removeFile(item.id)}
+                            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                            title="Remove from queue"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Progress Bar for EACH individual file */}
+                    <div className="mt-2.5 pt-2 border-t border-slate-200/50">
+                      <div className="flex items-center justify-between text-[11px] mb-1">
+                        <span
+                          className={`font-medium truncate max-w-[80%] ${
+                            isItemError
+                              ? 'text-rose-600 font-semibold'
+                              : isItemCompleted
+                              ? 'text-emerald-700'
+                              : isItemProcessing
+                              ? 'text-indigo-700 font-semibold'
+                              : 'text-slate-500'
+                          }`}
+                        >
+                          {item.stageText}
+                        </span>
+                        <span
+                          className={`font-mono tabular-nums font-semibold ${
+                            isItemCompleted
+                              ? 'text-emerald-700'
+                              : isItemError
+                              ? 'text-rose-600'
+                              : isItemProcessing
+                              ? 'text-indigo-600'
+                              : 'text-slate-400'
+                          }`}
+                        >
+                          {item.progress}%
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 bg-slate-200/60 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full transition-all duration-200 rounded-full ${
+                            isItemCompleted
+                              ? 'bg-emerald-500'
+                              : isItemError
+                              ? 'bg-rose-500'
+                              : isItemProcessing
+                              ? 'bg-indigo-600'
+                              : 'bg-slate-300'
+                          }`}
+                          style={{ width: `${Math.max(item.progress, item.status === 'queued' ? 0 : 5)}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
-            {/* Append dropzone for multi-file tools */}
-            {tool.maxFiles > 1 && selectedFiles.length < tool.maxFiles && (
+            {/* Multi-file append dropzone */}
+            {fileQueue.length < tool.maxFiles && !isProcessingBatch && (
               <div
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`p-3.5 mb-6 border-2 border-dashed rounded-xl text-center transition-all cursor-pointer ${
+                className={`p-3 mb-5 border-2 border-dashed rounded-xl text-center transition-all cursor-pointer ${
                   isDragging
                     ? 'border-indigo-600 bg-indigo-50/80 ring-2 ring-indigo-500/20'
-                    : 'border-slate-200 hover:border-indigo-400 bg-slate-50/50 hover:bg-slate-50'
+                    : 'border-slate-200 hover:border-indigo-400 bg-slate-50/40 hover:bg-slate-50'
                 }`}
               >
                 <div className="flex items-center justify-center gap-2 text-xs font-semibold text-indigo-700">
                   <Plus className="w-4 h-4" />
                   <span>
-                    Drag & drop additional files here or click to browse ({selectedFiles.length}/{tool.maxFiles})
+                    Drag & drop additional files here or click to add ({fileQueue.length}/{tool.maxFiles})
                   </span>
                 </div>
               </div>
             )}
 
-            {/* Step 2: Tool specific parameters */}
-            <div className="bg-slate-50/70 border border-slate-200/70 rounded-xl p-4 mb-6">
+            {/* Step 2: Tool Specific Settings */}
+            <div className="bg-slate-50/70 border border-slate-200/70 rounded-xl p-4 mb-5">
               <div className="flex items-center gap-2 mb-3">
                 <Sliders className="w-4 h-4 text-indigo-600" />
                 <span className="text-xs font-semibold text-slate-800 uppercase tracking-wider">
@@ -620,9 +1107,9 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
               {tool.id === 'compress-pdf' && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   {[
-                    { key: 'extreme', title: 'Extreme Compression', desc: 'Highest size reduction (~70-80%), standard quality' },
+                    { key: 'extreme', title: 'Extreme Compression', desc: 'Highest reduction (~70-80%), standard resolution' },
                     { key: 'medium', title: 'Recommended', desc: 'Balanced compression (~50-60%), high print quality' },
-                    { key: 'low', title: 'Less Compression', desc: 'Light reduction (~20-30%), pristine lossless graphics' },
+                    { key: 'low', title: 'Light Compression', desc: 'Light reduction (~20-30%), pristine lossless graphics' },
                   ].map((lvl) => (
                     <button
                       key={lvl.key}
@@ -694,7 +1181,9 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
                     </select>
                   </div>
                   <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">Page Margins ({pdfMargin}px)</label>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Page Margins ({pdfMargin}px)
+                    </label>
                     <input
                       type="range"
                       min={0}
@@ -746,10 +1235,10 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
                 </div>
               )}
 
-              {/* Generic info for word/pdf */}
+              {/* Generic info */}
               {(tool.id === 'merge-pdf' || tool.id === 'pdf-to-word' || tool.id === 'word-to-pdf' || tool.id === 'pdf-to-img') && (
                 <p className="text-xs text-slate-500">
-                  Default enterprise processing profile selected. Text encodings, vector shapes, and styling tags will be preserved.
+                  Enterprise engine active. Fonts, layout coordinates, and vector streams will be preserved.
                 </p>
               )}
             </div>
@@ -762,155 +1251,126 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
               </div>
             )}
 
-            {/* Processing Progress Bar */}
-            {isProcessing && (
-              <div className="p-4 bg-indigo-50/70 border border-indigo-100 rounded-xl mb-4">
-                <div className="flex items-center justify-between text-xs font-semibold text-indigo-900 mb-2">
-                  <div className="flex items-center gap-2">
-                    <RotateCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
-                    <span>{currentStage}</span>
-                  </div>
-                  <span className="tabular-nums font-mono text-indigo-600">{progressPercent}%</span>
-                </div>
-                <div className="w-full h-2 bg-indigo-200/50 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-indigo-600 transition-all duration-300 rounded-full"
-                    style={{ width: `${progressPercent}%` }}
-                  />
-                </div>
+            {/* Bottom Actions Bar */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span>{fileQueue.length} files queued</span>
+                {completedCount > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="text-emerald-700 font-semibold">{completedCount} converted</span>
+                  </>
+                )}
               </div>
-            )}
 
-            {/* Action Bar */}
-            {!resultData && (
-              <div className="flex items-center justify-end gap-3 pt-2">
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Download All as ZIP (bulk converted items) */}
+                {!isMergeTool && hasCompletedFiles && completedCount > 1 && (
+                  <button
+                    disabled={isZippingAll}
+                    onClick={handleDownloadAllZip}
+                    className="px-4 py-2.5 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer shadow-xs"
+                  >
+                    {isZippingAll ? (
+                      <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Archive className="w-3.5 h-3.5 text-slate-300" />
+                    )}
+                    <span>Download All as ZIP ({completedCount})</span>
+                  </button>
+                )}
+
+                {/* Primary Execute Button */}
                 <button
-                  disabled={isProcessing}
+                  disabled={isProcessingBatch || fileQueue.length === 0}
                   onClick={handleProcess}
                   className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-2 transition-colors cursor-pointer"
                 >
-                  <span>{isProcessing ? 'Processing Document...' : `Execute ${tool.title}`}</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
+                  {isProcessingBatch ? (
+                    <>
+                      <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>
+                        {isMergeTool
+                          ? 'Merging Files...'
+                          : `Converting Batch (${completedCount}/${fileQueue.length})...`}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span>
+                        {isMergeTool
+                          ? `Merge ${fileQueue.length} Files`
+                          : hasCompletedFiles
+                          ? `Re-convert ${fileQueue.length} Files`
+                          : `Convert All (${fileQueue.length} ${fileQueue.length === 1 ? 'file' : 'files'})`}
+                      </span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </>
+                  )}
                 </button>
               </div>
-            )}
+            </div>
           </div>
         )}
 
-        {/* Step 3: Success & Download Showcase */}
-        {resultData && (
+        {/* Merged Document Showcase (for merge-pdf or img-to-pdf) */}
+        {mergedResult && (
           <div className="p-6 bg-emerald-50/30 border-t border-slate-100">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-5 bg-white border border-emerald-200/80 rounded-2xl shadow-xs">
-              
               <div className="flex items-start gap-3.5 min-w-0">
                 <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
                   <CheckCircle2 className="w-6 h-6" />
                 </div>
                 <div className="min-w-0">
-                  <h4 className="text-sm font-bold text-slate-900 truncate">
-                    {resultData.filename}
-                  </h4>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-bold text-slate-900 truncate">
+                      {mergedResult.filename}
+                    </h4>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-semibold shrink-0">
+                      Merged PDF
+                    </span>
+                  </div>
                   <div className="flex items-center gap-2 text-xs text-slate-500 mt-0.5">
-                    <span className="tabular-nums">Size: {formatBytes(resultData.newSize)}</span>
-                    {resultData.savingsPercent !== undefined && resultData.savingsPercent > 0 && (
+                    <span className="tabular-nums">Final Size: {formatBytes(mergedResult.newSize)}</span>
+                    {mergedResult.pageCount && (
                       <>
                         <span>·</span>
-                        <span className="text-emerald-700 font-semibold tabular-nums">
-                          -{resultData.savingsPercent}% reduced
-                        </span>
+                        <span className="tabular-nums">{mergedResult.pageCount} pages combined</span>
                       </>
                     )}
                   </div>
                 </div>
               </div>
 
-              {/* Download Buttons */}
+              {/* Download & Actions */}
               <div className="flex flex-wrap items-center gap-2">
                 <a
-                  href={resultData.downloadUrl}
-                  download={resultData.filename}
+                  href={mergedResult.downloadUrl}
+                  download={mergedResult.filename}
                   className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold flex items-center gap-2 shadow-xs transition-colors cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
-                  <span>Download File</span>
+                  <span>Download Merged PDF</span>
                 </a>
-
-                {resultData.zipUrl && (
-                  <a
-                    href={resultData.zipUrl}
-                    download={`${resultData.filename.replace(/\.[^/.]+$/, '')}-bundle.zip`}
-                    className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
-                  >
-                    <Archive className="w-4 h-4 text-slate-600" />
-                    <span>Download All (ZIP)</span>
-                  </a>
-                )}
 
                 <button
                   onClick={() => {
-                    setResultData(null);
-                    setSelectedFiles([]);
+                    setMergedResult(null);
+                    clearAllFiles();
                   }}
-                  className="px-3 py-2.5 text-slate-600 hover:text-slate-900 text-xs font-medium transition-colors cursor-pointer"
+                  className="px-3.5 py-2.5 text-slate-600 hover:text-slate-900 text-xs font-medium transition-colors cursor-pointer"
                 >
-                  Convert Another
+                  Start New Batch
                 </button>
               </div>
             </div>
-
-            {/* Multi-page extracted files preview list */}
-            {resultData.secondaryFiles && resultData.secondaryFiles.length > 0 && (
-              <div className="mt-5">
-                <h5 className="text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2.5">
-                  Generated Output Files ({resultData.secondaryFiles.length})
-                </h5>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  {resultData.secondaryFiles.map((item, idx) => (
-                    <div
-                      key={idx}
-                      className="p-3 bg-white border border-slate-200 rounded-xl text-center flex flex-col justify-between"
-                    >
-                      {item.previewUrl ? (
-                        <div className="relative group mb-2 aspect-3/4 rounded-lg overflow-hidden bg-slate-100 border border-slate-200">
-                          <img
-                            src={item.previewUrl}
-                            alt={item.name}
-                            className="w-full h-full object-cover"
-                          />
-                          <button
-                            onClick={() => setPreviewItem({ url: item.previewUrl!, title: item.name })}
-                            className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white transition-opacity cursor-pointer"
-                          >
-                            <Eye className="w-5 h-5" />
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="w-10 h-10 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center mx-auto mb-2">
-                          <FileIcon className="w-5 h-5" />
-                        </div>
-                      )}
-                      <p className="text-[11px] font-medium text-slate-800 truncate mb-2">
-                        {item.name}
-                      </p>
-                      <a
-                        href={item.url}
-                        download={item.name}
-                        className="w-full py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold rounded-md transition-colors block text-center"
-                      >
-                        Download
-                      </a>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
 
-      {/* Preview Modal */}
+      {/* Image / Page Preview Modal */}
       {previewItem && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-2xl w-full p-4 overflow-hidden relative shadow-2xl">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
               <h4 className="text-sm font-semibold text-slate-900 truncate">
@@ -927,7 +1387,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
               <img
                 src={previewItem.url}
                 alt={previewItem.title}
-                className="max-h-[65vh] object-contain shadow-xs"
+                className="max-h-[65vh] object-contain shadow-xs rounded-lg"
               />
             </div>
           </div>
@@ -937,16 +1397,16 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({ toolId }) => {
       {/* Feature Guarantee & Trust Row */}
       <div className="mt-8 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs text-slate-500 border-t border-slate-200/80 pt-6">
         <div>
-          <strong className="text-slate-800 block mb-0.5">Zero Data Retention</strong>
-          Files are processed in sandboxed client runtime. No document is ever stored on external servers.
+          <strong className="text-slate-800 block mb-0.5">Zero Server File Retention</strong>
+          All batch conversions run 100% in your local browser sandbox. No documents ever touch an external server.
         </div>
         <div>
-          <strong className="text-slate-800 block mb-0.5">Lossless Vector Clarity</strong>
-          Fonts and vector curves remain crystal sharp for printing and professional publishing.
+          <strong className="text-slate-800 block mb-0.5">High-Speed Parallel Processing</strong>
+          Process dozens of files simultaneously with live per-file progress tracking and instant ZIP archiving.
         </div>
         <div>
-          <strong className="text-slate-800 block mb-0.5">3 Free Daily Conversions</strong>
-          Enjoy free tools daily without watermarks. Upgrade anytime for unlimited high-speed batching.
+          <strong className="text-slate-800 block mb-0.5">Pristine Output Quality</strong>
+          Fonts, vector line-work, and color spaces remain crisp and lossless for high-resolution printing.
         </div>
       </div>
     </div>

@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp } from '../context/AppContext';
+import logoImg from '../assets/images/nexipdf_logo.png';
 
 export const Footer: React.FC = () => {
   const { selectTool, setActiveView, currentUser, setIsAdminLoginModalOpen } = useApp();
@@ -12,8 +13,13 @@ export const Footer: React.FC = () => {
           {/* Col 1: Brand */}
           <div className="col-span-2 md:col-span-1">
             <div className="flex items-center gap-2 mb-3">
-              <div className="w-6 h-6 rounded-md bg-indigo-600 text-white flex items-center justify-center font-bold text-xs">
-                N
+              <div className="w-7 h-7 rounded-lg overflow-hidden shadow-xs border border-slate-200/90 bg-white flex items-center justify-center">
+                <img
+                  src={logoImg}
+                  alt="NexiPDF Logo"
+                  className="w-full h-full object-contain p-0.5 select-none"
+                  referrerPolicy="no-referrer"
+                />
               </div>
               <span className="font-bold text-slate-900 tracking-tight">NexiPDF</span>
             </div>
